@@ -16,6 +16,7 @@
 - **原始样本库存与批次制备**：可为已有原始样本补入**正整数份**库存并查询余额；`POST /batches/{id}/preparations` 按**正整数次数**制备批次，每制备一次混样按其配方消耗相应份数的上游批次，沿配方图逐层乘算、多路径需求合并为各原始样本的**整数消耗**（原始样本目标直接消耗自身）；核算与扣减在**同一 SQLite 写事务**内完成，任一样本库存不足即返回 **409** 与各样缺口、库存与制备记录均不变化，足量时一次扣减并保存目标批次、次数与消耗明细，可按记录 id 查询
 - **整单制备**：`POST /preparation-jobs` 一次接收**非空制备清单**（每项为已有批次 id + 正整数制备次数），同一批次重复出现时先**合并次数**；先沿配方图计算每项对原始样本的整数需求，再**按样本汇总整单需求**统一核算（共享样本不会被各项分别判为足量）；读取余额、核算缺口、扣减库存与写入各批次制备记录在**同一写事务**完成，任一样本不足返回包含该样本**总需求、余额与缺口**的 **409**、整单不留记录且余额不变；成功时返回各批次制备记录 id 与整单消耗，每条记录仍可由 `GET /preparations/{id}` 读取
 - **只读排产预演**：`POST /preparation-jobs/selection-preview` 接收 **1～12 条候选制备单**（每条为已有批次 id + 正整数次数，按请求位置标识订单，**允许重复批次**、不合并次数），复用配方图整数消耗展开计算每条订单对原始样本的需求，依据**同一库存快照**选出各样本总需求均不超过余额的子集——先**最大化入选订单数**，再**最大化入选制备次数之和**，仍并列时取**入选位置序列字典序最小**者；返回入选/未入选位置、按样本汇总的消耗与剩余库存，库存全不足时返回空集；**不扣减库存、不创建制备记录**
+- **制备记录冲正**：`POST /preparations/{id}/reversal` 对**存在且尚未冲正**的制备记录，按记录**已保存的消耗明细逐样本返还**原始样本库存，并保存与该记录**一一对应**的冲正时间；读取记录、判重、返还与保存在**同一 SQLite 写事务**内完成；**重复冲正幂等**返回同一冲正记录（200）且不再次返还，未知制备记录返回 **404**。`GET /preparations/{id}/reversal` 查询冲正时间、各样本返还份数与当前库存（明细按样本 id 升序），未冲正返回 **404**。单批制备与整单制备生成的记录均可冲正；冲正**不删改**原制备记录与消耗明细，`GET /preparations/{id}` 照常可查
 - 依赖安装与数据库建表全部纳入启动流程，无需手工初始化
 
 ## 快速开始（Docker）
@@ -67,6 +68,8 @@ docker compose up --build
 | `POST` | `/preparation-jobs` | 整单制备：多批次清单合并次数、按样本汇总需求一次扣减（不足 409 且整单回滚） |
 | `POST` | `/preparation-jobs/selection-preview` | 只读排产预演：1～12 条候选制备单按同一库存快照选型（不扣库存、不写记录） |
 | `GET` | `/preparations/{id}` | 按记录 id 查询制备记录（消耗明细 + 当前剩余库存） |
+| `POST` | `/preparations/{id}/reversal` | 制备记录冲正：按已保存消耗明细逐样本返还库存（重复冲正幂等，未知记录 404） |
+| `GET` | `/preparations/{id}/reversal` | 查询冲正时间、各样本返还份数及当前库存（未冲正 404） |
 
 ## 示例请求
 
@@ -550,6 +553,61 @@ curl -X POST http://localhost:8000/preparation-jobs/selection-preview \
 - 没有任何订单可行时返回空集：`selected_positions`、`consumptions`、`remaining_inventory` 均为空列表，`unselected_positions` 为全部位置；
 - 预演结果可直接作为 `/preparation-jobs` 的 `items` 提交执行（整单制备按汇总需求核算，与预演同一口径）。
 
+### 13. 制备记录冲正（逐样本返还库存）
+
+对一条**已经存在**的制备记录发起冲正：服务端按该记录**已保存的消耗明细**（不重新展开当前配方）把各原始样本当初消耗的份数**逐样本加回**库存，并保存与该记录**一一对应**的冲正时间。**单批制备**（`POST /batches/{id}/preparations`）与**整单制备**（`POST /preparation-jobs`）生成的记录结构相同，都可以冲正。
+
+- `POST /preparations/{id}/reversal`：首次冲正返回 **201**；记录读取、冲正判重、库存返还与冲正时间保存在**同一 SQLite 写事务**（`BEGIN IMMEDIATE`）内完成；
+- **重复冲正幂等**：对同一记录再次冲正不返还任何库存，返回 **200** 与**同一个冲正记录**（冲正时间不变）；
+- **未知制备记录**（不存在的 id）返回 **404**，不改动任何库存；
+- 冲正**不删改**原制备记录与消耗明细：`GET /preparations/{id}` 与批次接口照常可查，其中的剩余库存反映返还后的实时余额；冲正后也可以正常补库、再次制备。
+
+沿用前面的例子（P2=`1×P1+1×S1` id=4，每次消耗 `2×S1 + 1×S2`）。S1 补入 10 份、S2 补入 5 份，制备 P2 一次后余额为 S1=8、S2=4：
+
+```bash
+curl -X POST http://localhost:8000/batches/4/preparations \
+  -H 'Content-Type: application/json' -d '{"times": 1}'
+# 制备记录 id=1，consumptions：S1×2、S2×1
+
+curl -X POST http://localhost:8000/preparations/1/reversal
+```
+
+```json
+{
+  "preparation_id": 1,
+  "reversed_at": "2026-09-25T11:00:00.000Z",
+  "items": [
+    {"sample_id": 1, "sample_name": "S1", "returned_portions": 2, "balance": 10, "updated_at": "2026-09-25T10:00:00.000Z"},
+    {"sample_id": 2, "sample_name": "S2", "returned_portions": 1, "balance": 5,  "updated_at": "2026-09-25T10:00:00.000Z"}
+  ]
+}
+```
+
+- `returned_portions` 即制备记录保存的各样本消耗份数；`balance` 为返还后的当前库存；`items` 按**样本 id 升序**；
+- `updated_at` 是样本库存的**最近一次补入时间**，冲正返还不改写该时间（从未补入过时为 `null`）。
+
+**重复冲正**返回同一冲正记录（`reversed_at` 与首次一致）、状态码 **200**，库存不会被二次返还：
+
+```bash
+curl -X POST http://localhost:8000/preparations/1/reversal
+# 200，响应体与首次完全相同；S1、S2 余额仍为 10、5
+```
+
+`GET /preparations/{id}/reversal` 查询冲正时间、各样本返还份数与**查询时**的当前库存（后续补库/制备会反映在 `balance` 中，`returned_portions` 始终是历史明细）。制备记录**尚未冲正**与**记录不存在**均返回 **404**：
+
+```bash
+curl http://localhost:8000/preparations/1/reversal
+# 200：{"preparation_id":1,"reversed_at":"...","items":[...]}
+
+curl http://localhost:8000/preparations/2/reversal
+# 404 {"detail":"制备记录尚未冲正: 2"}
+
+curl http://localhost:8000/preparations/999/reversal
+# 404 {"detail":"制备记录不存在: 999"}
+```
+
+整单制备生成的多条记录可分别冲正：每条只按**自己的**消耗明细返还；整单中两条记录若消耗了同一个样本，两条各自冲正后该样本的两份返还都会加回。冲正不影响新的制备——库存返还后可用同一批次再次制备，新制备生成新的记录。
+
 ### 错误示例
 
 ```bash
@@ -661,6 +719,15 @@ curl -X POST http://localhost:8000/preparation-jobs/selection-preview \
 
 # 查询不存在的制备记录 → 404
 curl http://localhost:8000/preparations/999
+
+# 冲正不存在的制备记录 → 404 {"detail":"制备记录不存在: 999"}
+curl -X POST http://localhost:8000/preparations/999/reversal
+
+# 查询未冲正制备记录的冲正信息 → 404 {"detail":"制备记录尚未冲正: 1"}
+curl http://localhost:8000/preparations/1/reversal
+
+# 重复冲正不报错：首次 201，再次冲正幂等返回 200 且不再返还库存
+curl -X POST http://localhost:8000/preparations/1/reversal
 ```
 
 ## 占比计算说明
@@ -684,12 +751,12 @@ pytest                                 # 运行测试（使用临时数据库，
 
 ```
 app/
-  main.py       # FastAPI 路由与请求处理（禁配规则、目标占比规划、配方预演、份数诊断、库存补入、批次制备、整单制备与只读排产预演端点）
-  db.py         # SQLite 连接与建表（启动时自动执行，含禁配规则、库存与制备记录表及写事务设置）
+  main.py       # FastAPI 路由与请求处理（禁配规则、目标占比规划、配方预演、份数诊断、库存补入、批次制备、整单制备、只读排产预演与制备记录冲正端点）
+  db.py         # SQLite 连接与建表（启动时自动执行，含禁配规则、库存、制备记录与冲正记录表及写事务设置）
   schemas.py    # Pydantic 请求/响应模型（含严格正整数校验）
   service.py    # 递归占比计算、配方图可达原始样本、禁配补录影响预演、目标占比反算、配方预演、份数诊断、制备整数消耗与排产子集选型（Fraction 精确分数）
 tests/
-  test_api.py   # 端到端测试（含多级合并、约分、占比规划、配方预演、份数诊断、禁配规则与补录影响预演、库存与制备扣减、整单制备、只读排产预演、并发与各类非法输入）
+  test_api.py   # 端到端测试（含多级合并、约分、占比规划、配方预演、份数诊断、禁配规则与补录影响预演、库存与制备扣减、整单制备、只读排产预演、制备冲正幂等与返还、并发与各类非法输入）
 Dockerfile
 docker-compose.yml
 requirements.txt

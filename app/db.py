@@ -53,6 +53,13 @@ CREATE TABLE IF NOT EXISTS preparation_consumptions (
     portions       INTEGER NOT NULL CHECK (portions > 0),
     PRIMARY KEY (preparation_id, sample_id)
 );
+
+CREATE TABLE IF NOT EXISTS preparation_reversals (
+    -- 制备记录冲正：与制备记录一一对应，存在该行即表示已冲正（主键天然阻止重复冲正）；
+    -- 返还按 preparation_consumptions 中已保存的消耗明细逐样本进行，冲正不删改原记录
+    preparation_id INTEGER PRIMARY KEY REFERENCES preparations (id),
+    reversed_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
 """
 
 

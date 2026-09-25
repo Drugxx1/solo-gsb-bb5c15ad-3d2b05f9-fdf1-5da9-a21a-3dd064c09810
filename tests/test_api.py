@@ -1504,6 +1504,274 @@ def test_concurrent_preparations_serialize_without_overselling(client):
 
 
 # --------------------------------------------------------------------------- #
+# POST/GET /preparations/{id}/reversal 制备记录冲正
+# --------------------------------------------------------------------------- #
+
+
+def reverse_preparation(client, prep_id):
+    return client.post(f"/preparations/{prep_id}/reversal")
+
+
+def get_reversal(client, prep_id):
+    return client.get(f"/preparations/{prep_id}/reversal")
+
+
+def test_reverse_single_batch_preparation_returns_consumed_stock(client):
+    s1 = make_sample(client, "S1")
+    s2 = make_sample(client, "S2")
+    p1 = make_pool(client, "P1", [
+        {"batch_id": s1, "portions": 2}, {"batch_id": s2, "portions": 1}])
+    add_inventory(client, s1, 10)
+    add_inventory(client, s2, 5)
+    prep = prepare(client, p1, 2)
+    assert prep.status_code == 201
+    prep_id = prep.json()["id"]
+    assert get_inventory(client, s1).json()["balance"] == 6  # 10-4
+    assert get_inventory(client, s2).json()["balance"] == 3  # 5-2
+
+    r = reverse_preparation(client, prep_id)
+    assert r.status_code == 201, r.text
+    body = r.json()
+    assert body["preparation_id"] == prep_id
+    assert isinstance(body["reversed_at"], str) and body["reversed_at"]
+    assert [x["sample_id"] for x in body["items"]] == [s1, s2]  # 按样本 id 升序
+    assert body["items"][0] == {
+        "sample_id": s1, "sample_name": "S1", "returned_portions": 4,
+        "balance": 10, "updated_at": get_inventory(client, s1).json()["updated_at"]}
+    assert body["items"][1] == {
+        "sample_id": s2, "sample_name": "S2", "returned_portions": 2,
+        "balance": 5, "updated_at": get_inventory(client, s2).json()["updated_at"]}
+    # 库存已逐样本返还
+    assert get_inventory(client, s1).json()["balance"] == 10
+    assert get_inventory(client, s2).json()["balance"] == 5
+
+
+def test_reverse_sample_target_preparation_returns_itself(client):
+    s1 = make_sample(client, "S1")
+    add_inventory(client, s1, 8)
+    prep_id = prepare(client, s1, 3).json()["id"]
+    assert get_inventory(client, s1).json()["balance"] == 5
+
+    r = reverse_preparation(client, prep_id)
+    assert r.status_code == 201, r.text
+    assert r.json()["items"] == [{
+        "sample_id": s1, "sample_name": "S1", "returned_portions": 3,
+        "balance": 8, "updated_at": get_inventory(client, s1).json()["updated_at"]}]
+    assert get_inventory(client, s1).json()["balance"] == 8
+
+
+def test_reverse_nested_preparation_refunds_every_consumed_sample(client):
+    s1 = make_sample(client, "S1")
+    s2 = make_sample(client, "S2")
+    p1 = make_pool(client, "P1", [
+        {"batch_id": s1, "portions": 1}, {"batch_id": s2, "portions": 1}])
+    # P2 = 1×P1 + 1×S1：一次消耗 2×S1 + 1×S2
+    p2 = make_pool(client, "P2", [
+        {"batch_id": p1, "portions": 1}, {"batch_id": s1, "portions": 1}])
+    add_inventory(client, s1, 10)
+    add_inventory(client, s2, 10)
+    prep_id = prepare(client, p2, 2).json()["id"]  # 4×S1、2×S2
+    assert {get_inventory(client, s1).json()["balance"],
+            get_inventory(client, s2).json()["balance"]} == {6, 8}
+
+    assert reverse_preparation(client, prep_id).status_code == 201
+    assert get_inventory(client, s1).json()["balance"] == 10
+    assert get_inventory(client, s2).json()["balance"] == 10
+
+
+def test_reverse_job_created_preparation_refunds_saved_details(client):
+    # 整单制备生成的记录同样可冲正：按各记录保存的消耗明细逐样本返还
+    s1 = make_sample(client, "S1")
+    s2 = make_sample(client, "S2")
+    p1 = make_pool(client, "P1", [
+        {"batch_id": s1, "portions": 1}, {"batch_id": s2, "portions": 1}])
+    add_inventory(client, s1, 10)
+    add_inventory(client, s2, 10)
+    job = client.post("/preparation-jobs", json={"items": [
+        {"batch_id": p1, "times": 1}, {"batch_id": s1, "times": 1}]})
+    assert job.status_code == 201, job.text
+    # 整单消耗 2×S1 + 1×S2：余额 8、9
+    assert get_inventory(client, s1).json()["balance"] == 8
+    assert get_inventory(client, s2).json()["balance"] == 9
+
+    prep_ids = sorted(p["preparation_id"] for p in job.json()["preparations"])
+    r1 = reverse_preparation(client, prep_ids[0])
+    r2 = reverse_preparation(client, prep_ids[1])
+    assert r1.status_code == 201 and r2.status_code == 201
+    returned = {}
+    for body in (r1.json(), r2.json()):
+        for item in body["items"]:
+            returned[item["sample_id"]] = returned.get(item["sample_id"], 0) + item["returned_portions"]
+    assert returned == {s1: 2, s2: 1}
+    # 两条记录分别冲正后，库存恢复到制备前
+    assert get_inventory(client, s1).json()["balance"] == 10
+    assert get_inventory(client, s2).json()["balance"] == 10
+
+
+def test_reverse_unknown_preparation_returns_404_and_changes_nothing(client):
+    s1 = make_sample(client, "S1")
+    add_inventory(client, s1, 5)
+    before = get_inventory(client, s1).json()
+    r = reverse_preparation(client, 4242)
+    assert r.status_code == 404
+    assert "4242" in r.json()["detail"]
+    assert get_inventory(client, s1).json() == before
+
+
+def test_reverse_is_idempotent_same_record_no_double_refund(client):
+    s1 = make_sample(client, "S1")
+    s2 = make_sample(client, "S2")
+    p1 = make_pool(client, "P1", [
+        {"batch_id": s1, "portions": 1}, {"batch_id": s2, "portions": 1}])
+    add_inventory(client, s1, 10)
+    add_inventory(client, s2, 10)
+    prep_id = prepare(client, p1, 2).json()["id"]  # 各消耗 2 份 → 8、8
+
+    first = reverse_preparation(client, prep_id)
+    assert first.status_code == 201
+    assert get_inventory(client, s1).json()["balance"] == 10
+    assert get_inventory(client, s2).json()["balance"] == 10
+
+    second = reverse_preparation(client, prep_id)
+    assert second.status_code == 200  # 重复冲正幂等
+    third = reverse_preparation(client, prep_id)
+    assert third.status_code == 200
+    # 同一冲正记录：冲正时间一致，不再次返还
+    assert second.json() == first.json()
+    assert third.json() == first.json()
+    assert get_inventory(client, s1).json()["balance"] == 10
+    assert get_inventory(client, s2).json()["balance"] == 10
+
+
+def test_get_reversal_returns_reversed_at_returns_and_current_balance(client):
+    s1 = make_sample(client, "S1")
+    s2 = make_sample(client, "S2")
+    p1 = make_pool(client, "P1", [
+        {"batch_id": s1, "portions": 1}, {"batch_id": s2, "portions": 1}])
+    add_inventory(client, s1, 10)
+    add_inventory(client, s2, 10)
+    prep_id = prepare(client, p1, 1).json()["id"]
+    post_body = reverse_preparation(client, prep_id).json()
+
+    r = get_reversal(client, prep_id)
+    assert r.status_code == 200, r.text
+    assert r.json() == post_body
+
+    # 冲正后补库：GET 返回的当前库存为实时值，返还份数是历史明细不变
+    add_inventory(client, s1, 4)
+    body = get_reversal(client, prep_id).json()
+    assert body["reversed_at"] == post_body["reversed_at"]
+    assert [(x["sample_id"], x["returned_portions"]) for x in body["items"]] == [
+        (s1, 1), (s2, 1)]
+    # 冲正已把各样本恢复到 10；之后只补了 S1，故 S2 仍为 10
+    assert {x["sample_id"]: x["balance"] for x in body["items"]} == {
+        s1: 14, s2: 10}
+
+
+def test_get_reversal_unknown_preparation_returns_404(client):
+    r = get_reversal(client, 4242)
+    assert r.status_code == 404
+    assert "4242" in r.json()["detail"]
+
+
+def test_get_reversal_not_reversed_returns_404(client):
+    s1 = make_sample(client, "S1")
+    add_inventory(client, s1, 5)
+    prep_id = prepare(client, s1, 1).json()["id"]
+    r = get_reversal(client, prep_id)
+    assert r.status_code == 404
+    assert str(prep_id) in r.json()["detail"]
+    # 未冲正：库存仍为扣减后的余额
+    assert get_inventory(client, s1).json()["balance"] == 4
+
+
+def test_original_preparation_and_consumptions_remain_queryable_after_reversal(client):
+    s1 = make_sample(client, "S1")
+    s2 = make_sample(client, "S2")
+    p1 = make_pool(client, "P1", [
+        {"batch_id": s1, "portions": 1}, {"batch_id": s2, "portions": 1}])
+    add_inventory(client, s1, 5)
+    add_inventory(client, s2, 5)
+    prep = prepare(client, p1, 1)
+    prep_body = prep.json()
+    prep_id = prep_body["id"]
+
+    assert reverse_preparation(client, prep_id).status_code == 201
+
+    # 原制备记录与消耗明细保持可查；remaining_inventory 反映返还后的实时余额
+    rec = client.get(f"/preparations/{prep_id}")
+    assert rec.status_code == 200
+    assert rec.json()["consumptions"] == prep_body["consumptions"]
+    assert {x["sample_id"]: x["balance"] for x in rec.json()["remaining_inventory"]} == {
+        s1: 5, s2: 5}
+    # 批次本身也不受影响
+    assert client.get(f"/batches/{p1}").status_code == 200
+
+
+def test_multiple_preparation_records_reverse_independently(client):
+    s1 = make_sample(client, "S1")
+    p1 = make_pool(client, "P1", [{"batch_id": s1, "portions": 1}])
+    add_inventory(client, s1, 10)
+    id1 = prepare(client, p1, 2).json()["id"]  # -2 → 8
+    id2 = prepare(client, p1, 3).json()["id"]  # -3 → 5
+
+    assert reverse_preparation(client, id1).status_code == 201
+    assert get_inventory(client, s1).json()["balance"] == 7  # 仅返还 id1
+    # id2 未冲正
+    assert get_reversal(client, id2).status_code == 404
+    body2 = reverse_preparation(client, id2).json()
+    assert body2["items"][0]["returned_portions"] == 3
+    assert get_inventory(client, s1).json()["balance"] == 10
+    # 重复冲正 id1 不再返还
+    assert reverse_preparation(client, id1).status_code == 200
+    assert get_inventory(client, s1).json()["balance"] == 10
+
+
+def test_reversal_refund_enables_preparing_again(client):
+    s1 = make_sample(client, "S1")
+    p1 = make_pool(client, "P1", [{"batch_id": s1, "portions": 1}])
+    add_inventory(client, s1, 3)
+    prep_id = prepare(client, p1, 3).json()["id"]
+    assert get_inventory(client, s1).json()["balance"] == 0
+    # 库存耗尽后再制备被 409
+    assert prepare(client, p1, 1).status_code == 409
+    # 冲正返还后可重新制备
+    assert reverse_preparation(client, prep_id).status_code == 201
+    assert get_inventory(client, s1).json()["balance"] == 3
+    assert prepare(client, p1, 1).status_code == 201
+    assert get_inventory(client, s1).json()["balance"] == 2
+
+
+def test_concurrent_reversals_refund_only_once(client):
+    # 并发冲正同一记录：写事务串行使判重可靠，库存只返还一次
+    s1 = make_sample(client, "S1")
+    p1 = make_pool(client, "P1", [{"batch_id": s1, "portions": 1}])
+    add_inventory(client, s1, 5)
+    prep_id = prepare(client, p1, 2).json()["id"]  # 余 3
+    barrier = threading.Barrier(6)
+    codes: list[int] = []
+    times: list[str] = []
+    lock = threading.Lock()
+
+    def reverse():
+        barrier.wait()
+        r = reverse_preparation(client, prep_id)
+        with lock:
+            codes.append(r.status_code)
+            times.append(r.json()["reversed_at"])
+
+    threads = [threading.Thread(target=reverse) for _ in range(6)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert sorted(codes) == [200] * 5 + [201]
+    assert get_inventory(client, s1).json()["balance"] == 5  # 只返还 2 份一次
+    assert set(times) == {get_reversal(client, prep_id).json()["reversed_at"]}
+
+
+# --------------------------------------------------------------------------- #
 # POST /preparation-jobs 整单制备
 # --------------------------------------------------------------------------- #
 
