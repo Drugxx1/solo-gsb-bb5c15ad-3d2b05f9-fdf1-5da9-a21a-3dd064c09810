@@ -17,6 +17,8 @@
 - POST /preparation-jobs               整单制备：多批次清单合并核算，按样本汇总需求一次扣减（不足 409 且整单回滚）
 - POST /preparation-jobs/selection-preview 只读排产预演：1～12 条候选制备单按同一库存快照选型（不扣库存、不写记录）
 - GET  /preparations/{preparation_id}  按记录 id 查询制备记录（含消耗明细与当前剩余库存）
+- POST /preparations/{preparation_id}/reversal 冲正制备记录：按保存的消耗明细逐样本返还库存（重复冲正幂等）
+- GET  /preparations/{preparation_id}/reversal 查询冲正时间、各样本返还份数与当前库存（未冲正 404）
 """
 from __future__ import annotations
 
@@ -55,6 +57,8 @@ from .schemas import (
     PreparationJobCreateRequest,
     PreparationJobOut,
     PreparationOut,
+    PreparationReversalOut,
+    PreparationReversalReturnOut,
     PreviewComponentOut,
     RecipeItemOut,
     RecipePreviewOut,
@@ -961,6 +965,145 @@ def get_preparation(
             status.HTTP_404_NOT_FOUND, detail=f"制备记录不存在: {preparation_id}"
         )
     return _build_preparation_out(conn, prep)
+
+
+def _build_reversal_out(
+    conn: sqlite3.Connection, preparation_id: int, reversed_at: str
+) -> PreparationReversalOut:
+    """组装冲正响应：按保存的消耗明细给出各样本返还份数与当前库存。
+
+    明细按样本 id 升序；LEFT JOIN/COALESCE 仅为“被消耗样本无库存行”的
+    异常数据兜底（冲正 UPSERT 后正常数据必有该行）。
+    """
+    rows = conn.execute(
+        """
+        SELECT pc.sample_id, b.name AS sample_name, pc.portions,
+               COALESCE(si.balance, 0) AS balance, si.updated_at AS updated_at
+        FROM preparation_consumptions pc
+        JOIN batches b ON b.id = pc.sample_id
+        LEFT JOIN sample_inventory si ON si.sample_id = pc.sample_id
+        WHERE pc.preparation_id = ?
+        ORDER BY pc.sample_id
+        """,
+        (preparation_id,),
+    ).fetchall()
+    return PreparationReversalOut(
+        preparation_id=preparation_id,
+        reversed_at=reversed_at,
+        returns=[
+            PreparationReversalReturnOut(
+                sample_id=r["sample_id"],
+                sample_name=r["sample_name"],
+                returned_portions=r["portions"],
+                balance=r["balance"],
+                updated_at=r["updated_at"],
+            )
+            for r in rows
+        ],
+    )
+
+
+@app.post(
+    "/preparations/{preparation_id}/reversal",
+    response_model=PreparationReversalOut,
+    summary="冲正制备记录：按保存的消耗明细逐样本返还原始样本库存（重复冲正幂等）",
+)
+def reverse_preparation(
+    preparation_id: int,
+    response: Response,
+    conn: sqlite3.Connection = Depends(get_db),
+) -> PreparationReversalOut:
+    # 读取记录、判重、库存返还与冲正记录保存必须在同一 SQLite 写事务内完成：
+    # BEGIN IMMEDIATE 立即取写锁，并发冲正同一记录相互串行，不可能重复返还
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        prep = conn.execute(
+            "SELECT id FROM preparations WHERE id = ?", (preparation_id,)
+        ).fetchone()
+        if prep is None:
+            # 未知制备记录：回滚后返回 404（与 GET 一致）
+            conn.rollback()
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND, detail=f"制备记录不存在: {preparation_id}"
+            )
+
+        existing = conn.execute(
+            "SELECT reversed_at FROM preparation_reversals WHERE preparation_id = ?",
+            (preparation_id,),
+        ).fetchone()
+        if existing is not None:
+            # 已冲正：不再次返还，幂等返回同一冲正记录（200 + 首次冲正时间）
+            conn.rollback()
+            response.status_code = status.HTTP_200_OK
+            return _build_reversal_out(conn, preparation_id, existing["reversed_at"])
+
+        # 按已保存的消耗明细逐样本返还：UPSERT 兼容“库存行已存在/已被清掉”，
+        # 同时把该样本库存的更新时间刷新为冲正时刻
+        consumed = conn.execute(
+            """
+            SELECT sample_id, portions FROM preparation_consumptions
+            WHERE preparation_id = ?
+            """,
+            (preparation_id,),
+        ).fetchall()
+        conn.executemany(
+            """
+            INSERT INTO sample_inventory (sample_id, balance, updated_at)
+            VALUES (?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+            ON CONFLICT (sample_id) DO UPDATE SET
+                balance = balance + excluded.balance,
+                updated_at = excluded.updated_at
+            """,
+            [(r["sample_id"], r["portions"]) for r in consumed],
+        )
+        cur = conn.execute(
+            "INSERT INTO preparation_reversals (preparation_id) VALUES (?)",
+            (preparation_id,),
+        )
+        conn.commit()
+    except HTTPException:
+        raise
+    except sqlite3.IntegrityError:
+        # 并发下另一事务已抢先冲正：与重复冲正同等处理，幂等返回 200
+        conn.rollback()
+        row = conn.execute(
+            "SELECT reversed_at FROM preparation_reversals WHERE preparation_id = ?",
+            (preparation_id,),
+        ).fetchone()
+        response.status_code = status.HTTP_200_OK
+        return _build_reversal_out(conn, preparation_id, row["reversed_at"])
+
+    reversed_at = conn.execute(
+        "SELECT reversed_at FROM preparation_reversals WHERE rowid = ?", (cur.lastrowid,)
+    ).fetchone()["reversed_at"]
+    response.status_code = status.HTTP_201_CREATED
+    return _build_reversal_out(conn, preparation_id, reversed_at)
+
+
+@app.get(
+    "/preparations/{preparation_id}/reversal",
+    response_model=PreparationReversalOut,
+    summary="查询冲正记录（冲正时间、各样本返还份数与当前库存）",
+)
+def get_preparation_reversal(
+    preparation_id: int, conn: sqlite3.Connection = Depends(get_db)
+) -> PreparationReversalOut:
+    # 未知制备记录与未冲正均返回 404；只有已冲正记录可查
+    row = conn.execute(
+        """
+        SELECT pr.reversed_at
+        FROM preparation_reversals pr
+        JOIN preparations p ON p.id = pr.preparation_id
+        WHERE pr.preparation_id = ?
+        """,
+        (preparation_id,),
+    ).fetchone()
+    if row is None:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            detail=f"制备记录未冲正或不存在: {preparation_id}",
+        )
+    return _build_reversal_out(conn, preparation_id, row["reversed_at"])
 
 
 @app.post(

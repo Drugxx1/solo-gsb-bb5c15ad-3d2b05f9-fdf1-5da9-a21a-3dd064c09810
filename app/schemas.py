@@ -248,6 +248,22 @@ class PreparationOut(BaseModel):
     remaining_inventory: list[InventoryOut]        # 扣减后的剩余库存，按样本 id 升序
 
 
+class PreparationReversalReturnOut(BaseModel):
+    """冲正时按已保存消耗明细返还的一个原始样本（份数 = 该记录当时的消耗份数）。"""
+
+    sample_id: int
+    sample_name: str
+    returned_portions: int  # 冲正返还的整数份数（取自该制备记录的消耗明细，不重新展开配方）
+    balance: int            # 返还后的当前库存余额（份）
+    updated_at: str | None = None  # 当前库存的最近更新时间；从未有库存行时为 null
+
+
+class PreparationReversalOut(BaseModel):
+    preparation_id: int
+    reversed_at: str  # 冲正时间（与制备记录一一对应，重复冲正返回同一时间）
+    returns: list[PreparationReversalReturnOut]  # 各样本返还份数及当前库存，按样本 id 升序
+
+
 class PreparationJobItem(BaseModel):
     """整单制备中的一项：已有批次 id + 正整数制备次数。"""
 
